@@ -151,3 +151,9 @@ Pretty neeeeeet!!!!!
 - FineWeb-Edu is a subset of FineWeb datset with education content. It comes in 1.3T and 5.4T token sizes.
 
 - There are samples of sizes 10B, 100B and 350B tokens.
+
+# HellaSwag Validation
+
+- It is a benchmark dataset sentence completion MCQ questions where for a question, one answer is right and makes sence while the others are incorrect which doesn't make sense.
+- In 2019, human accuracy was 95% and LLM accuracy was 45%. However, this benchmark in 2024 is crushed and LLMs achecive > 95% accuracy.
+- It covers a wide variety of topics. 

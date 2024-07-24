@@ -14,6 +14,8 @@ from torch.distributed import init_process_group, destroy_process_group
 
 import tiktoken
 
+from hellaswag import render_example, iterate_examples
+
 import os
 import time
 import inspect
@@ -23,6 +25,7 @@ import sys
 
 # Parameters
 relative_input_path = '../data/shakespear.txt'
+log_dir = '../log'
 
 total_batch_size = 524288       # in terms of tokens(B, T) 2**19
 #total_batch_size = 524288 // 4
@@ -65,8 +68,8 @@ class CasualSelfAttention(nn.Module):
         self.c_proj = nn.Linear(config.n_embed, config.n_embed)         # projection because of skip connection
         # flag to indicate this layer should be scaled to maintain std 1.0 after residual connection
         self.c_proj.RESIDUAL_SCALE = 1
-        mask = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
-        self.register_buffer("bias", mask)
+        #mask = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
+        #self.register_buffer("bias", mask)
 
     def forward(self, x : torch.Tensor):
         # B-> Batch T-> Tokens(time) C-> Channels(embeddings)
@@ -283,7 +286,6 @@ class DataLoader:
 
 # Cosine decay learning rate scheduler
 def get_lr(epoch):
-    
     # Linear warmup going on
     if epoch < warmup_epochs:
         return max_lr * (epoch+1) / warmup_epochs
@@ -295,6 +297,26 @@ def get_lr(epoch):
     assert 0 <= decay_ratio <= 1,0
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
+
+# Hellaswag
+def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
 
 # ___________________________________MODEL SETUP____________________________________________________________
 
@@ -345,14 +367,16 @@ assert total_batch_size % (micro_batch_size*micro_block_size*ddp_world_size) == 
 # Accumulate gradients for these many steps
 grad_accum_steps = total_batch_size // (micro_batch_size*micro_block_size*ddp_world_size)
 if master_process:          # Only printed by master process
-    print(f"{grad_accum_steps} micro batches will be processed in one major batch")
+    print(f"{grad_accum_steps} micro batches will be processed in one major batch and {epochs} major batches will make one epoch")
 
 # Initializing DataLoader, Model, Optimizer
 train_data_loader = DataLoader(micro_batch_size, micro_block_size, input_file_path, process_rank = ddp_rank, num_processes = ddp_world_size, split = 'train')
 val_data_loader = DataLoader(micro_batch_size, micro_block_size, input_file_path, process_rank = ddp_rank, num_processes = ddp_world_size, split = 'val')
 model = GPT(GPTConfig(vocab_size = 50304))
 model.to(device)
-model = torch.compile(model)
+use_compile = False
+if use_compile:
+    model = torch.compile(model)
 # This container wraps the model in a DDP class which makes no change in the forward pass, but
 # during backward pass, when the gradients from each process is accumulated, it averages out all gradients
 # from each process and populates the average in each process's gradients
@@ -362,6 +386,13 @@ if ddp:
 raw_model = model.module if ddp else model
 optimizer = raw_model.configure_optimizer(weight_decay = 0.1, learning_rate = 6e-4, device = device)
 
+# Directory for checkpoints
+os.makedirs(log_dir, exist_ok = True)
+log_file = os.path.join(log_dir, f"log.txt")
+# Kept open to write
+with open(log_file, 'w') as f:
+    pass
+
 
 # ___________________________________TRAINING PHASE_______________________________________________________
 
@@ -370,10 +401,12 @@ for epoch in range(epochs):
     # record time
     tock = time.time()
 
-    # ________________Calculate val loss______________________________
+    # ________________Calculate val loss and save checkpoint______________________________
     
     # Print validation loss once in a while
-    if epoch % 100 == 0:
+    last_step = epoch == epochs - 1
+
+    if epoch % 3 == 0:
         model.eval()
         val_data_loader.reset()
         with torch.no_grad():
@@ -390,17 +423,68 @@ for epoch in range(epochs):
             dist.all_reduce(val_loss_accum, op = dist.ReduceOp.AVG)
         if master_process:
             print(f"Validation Loss --> {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{epoch} Validation Loss --> {val_loss_accum.item():.4f}\n")
 
+        # Save the Checkpoint
+        if epoch > 0 and (epoch % 3 == 0 or last_step):
+            checkpoint_path = os.path.join(log_dir, f"model_{epoch:05d}.pt")
+            checkpoint = {
+                'model' : raw_model.state_dict(),
+                'config' : raw_model.config,
+                'step' : epoch,
+                'val_loss' : val_loss_accum.item()
+            }
+            # optimizer.state_dict() also needs to be save along with rng seed, etc to properly resume
+            torch.save(checkpoint, checkpoint_path)
+            if master_process:
+                print(f"Saved checkpoint model_{epoch:05d}.pt")
+
+    # __________________log the hellaswag results____________________________
+
+    # once in a while evaluate hellaswag
+    if (epoch % 3 == 0 or last_step) and (not use_compile):
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_examples("val")):
+            # only process examples where i % ddp_world_size == ddp_rank
+            if i % ddp_world_size != ddp_rank:
+                continue
+            # render the example into tokens and labels
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            # get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=autocast_device, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        # reduce the stats across all processes
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"HellaSwag accuracy --> {num_correct_norm}/{num_total} = {acc_norm:.4f}%")
+            with open(log_file, "a") as f:
+                f.write(f"{epoch} hella {acc_norm:.4f}\n")
+    
     # __________________generate sample text____________________________
 
     # Print some samples every once in a while 
-    if generate_samples and epoch > 0 and epoch % 3 == 0:
+    if generate_samples and epoch > 0 and epoch % 3 == 0 and (not use_compile):
         # model in eval
         model.eval()
         # Get tokens of input
         num_returned_sequences = 2
         max_length = 32
-        tokens = tiktoken.get_encoding(text)
+        tokens = encoder.encode(text)
         tokens = torch.tensor(tokens, dtype = torch.long)
         tokens = tokens.unsqueeze(0).repeat(num_returned_sequences, 1)
         xgen = tokens.to(device)
@@ -410,7 +494,7 @@ for epoch in range(epochs):
         while xgen.size(1) < max_length:
             with torch.no_grad():
                 # Feedforward
-                logits = model(xgen)
+                logits, loss = model(xgen)
                 # Grab the last token logits
                 logits = logits[:, -1, :]       # [B, vocab_size]
                 # Get the probabilities to sample from
@@ -421,11 +505,14 @@ for epoch in range(epochs):
                 # Now sample from this top_prob (returns the index of chosen value from dist)
                 ix = torch.multinomial(top_probs, num_samples = 1, generator = sample_rng)       # [B, 1]
                 # Gather the topk incides
-                xval = torch.gather(top_indices, -1, ix)        # [B, 1]
+                xcol = torch.gather(top_indices, -1, ix)        # [B, 1]
                 # Append to the input sequence to repeat
-                x = torch.cat([x, xval], dim=-1)                # [B, 1]
+                xgen = torch.cat([xgen, xcol], dim=-1)                # [B, 1]
         # Print the generated text
-
+        for i in range(num_returned_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = encoder.decode(tokens)
+            print(f"[ddp rank -> {ddp_rank}] sample -> {i} | {decoded}")
 
     # __________training | forward -> backward -> update__________________
 
