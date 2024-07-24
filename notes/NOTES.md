@@ -139,3 +139,15 @@ Pretty neeeeeet!!!!!
 - The DDP() will do an all_reduce() after backpropagation that will propagate the average gradients too all processes. This is done when loss.backward() is called.
 
 - In our code, this sync will happen in every iteration of micro_batch calculation because we do forward and backward for every micro bitch and later take optimization step. We want to sync only after the entire micro batches gradients have been populated. Then we once do a all_reduce() and take a step of optimization.
+
+# Datasets
+
+- OpenAI does not release the datasets but mention the content and there are open source options available.
+
+- RedPajama is a popular dataset with 1.21T tokens and SlimPajama is a smaller version of RedPajama with 627B tokens
+
+- FineWeb is a new dataset with 15T tokens that takes 44TB of disk space. It is curation of lot's of sources including common crawl.
+
+- FineWeb-Edu is a subset of FineWeb datset with education content. It comes in 1.3T and 5.4T token sizes.
+
+- There are samples of sizes 10B, 100B and 350B tokens.
