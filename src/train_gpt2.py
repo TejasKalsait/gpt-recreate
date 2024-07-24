@@ -1,6 +1,9 @@
+# _____________________________IMPORTS___________________________________________________________________
+
 from dataclasses import dataclass
 
 import math
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -16,6 +19,8 @@ import time
 import inspect
 import sys
 
+# _____________________________PARAMETERS___________________________________________________________________
+
 # Parameters
 relative_input_path = '../data/shakespear.txt'
 
@@ -27,9 +32,15 @@ micro_block_size = 512
 
 max_lr = 6e-4
 min_lr = 0.1 * max_lr
-warmup_epochs = 10
+warmup_epochs = 715
 
-epochs = 50
+epochs = 19073
+
+generate_samples = True
+text = "The human body is capable of"
+encoder = tiktoken.get_encoding("gpt2")
+
+# _____________________________________CLASSES_________________________________________________________________
 
 # Class to store the model parameters
 @dataclass
@@ -218,27 +229,38 @@ class GPT(nn.Module):
 # Creating a data loader that retuns a fresh batch of x, y
 class DataLoader:
 
-    def __init__(self, B, T, input_file, process_rank, num_processes) -> None:
+    def __init__(self, B, T, input_file, process_rank, num_processes, split) -> None:
         # saving shapes
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
-        # Open file and save data at initialization
-        with open(input_file, 'r') as f:
-            text = f.read()
-        # encode text and create tokens
-        encoder = tiktoken.get_encoding("gpt2")
-        tokens = encoder.encode(text)
-        self.tokens = torch.tensor(tokens)
-        if master_process:
-            # stats
-            print(f"Loaded data. Total {len(self.tokens)} tokens available")
-            print(f"1 epoch consists of {len(self.tokens) // (B * T)} major batches")
+        assert split in {'train', 'val'}
 
+        # Open file and save data at initialization
+        data_root = "../data/edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(self.shards) > 0, f"No shards found for split {split}"
+        # stats
+        if master_process:
+            print(f"Found {len(shards)} shards for split {split}")
+
+        self.reset()
+
+    def load_tokens(self, filename):
+        npt = np.load(filename)
+        ptt = torch.tensor(npt, dtype = torch.long)
+        return ptt
+    
+    def reset(self):
+        self.current_shard = 0
+        self.tokens = self.load_tokens(self.shards[self.current_shard])
         # From which index to sample the batch from (depends on which process this is)
         self._start = self.B * self.T * self.process_rank
-
+    
     def next_batch(self):
 
         B, T = self.B, self.T   # batch size and context size
@@ -251,11 +273,13 @@ class DataLoader:
         # Move the start to next batch start
         self._start += (B * T * self.num_processes)
         # In case next batch sampling will go out of bounds, reset to zero
-        if self._start + (B * T + 1) > len(self.tokens):
+        if self._start + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)        # Loops from 0 to 99
+            self.tokens = self.load_tokens(self.shards[self.current_shard])
             self._start = self.B * self.T * self.process_rank
-
         return x, y
-# ________________________________________________________________________________________________________________
+
+# ___________________________________UTIL FUNCTIONS_________________________________________________________
 
 # Cosine decay learning rate scheduler
 def get_lr(epoch):
@@ -271,6 +295,8 @@ def get_lr(epoch):
     assert 0 <= decay_ratio <= 1,0
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
+
+# ___________________________________MODEL SETUP____________________________________________________________
 
 # Set up DDP (Distributed Data Parallel)
 ddp = int(os.environ.get('RANK', -1)) != -1     # Bool if ddp is present
@@ -322,7 +348,8 @@ if master_process:          # Only printed by master process
     print(f"{grad_accum_steps} micro batches will be processed in one major batch")
 
 # Initializing DataLoader, Model, Optimizer
-data_loader = DataLoader(micro_batch_size, micro_block_size, input_file_path, process_rank = ddp_rank, num_processes = ddp_world_size)
+train_data_loader = DataLoader(micro_batch_size, micro_block_size, input_file_path, process_rank = ddp_rank, num_processes = ddp_world_size, split = 'train')
+val_data_loader = DataLoader(micro_batch_size, micro_block_size, input_file_path, process_rank = ddp_rank, num_processes = ddp_world_size, split = 'val')
 model = GPT(GPTConfig(vocab_size = 50304))
 model.to(device)
 model = torch.compile(model)
@@ -333,26 +360,85 @@ if ddp:
     model = DDP(model, device_ids = [ddp_local_rank])
 # Unwrapping the raw model from the DDP wrap to pass to optimizer
 raw_model = model.module if ddp else model
-optimizer = model.configure_optimizer(weight_decay = 0.1, learning_rate = 6e-4, device = device)
+optimizer = raw_model.configure_optimizer(weight_decay = 0.1, learning_rate = 6e-4, device = device)
 
 
-# _____________________________________________________________________________________________________
+# ___________________________________TRAINING PHASE_______________________________________________________
 
 # Training Loop
 for epoch in range(epochs):
     # record time
     tock = time.time()
 
+    # ________________Calculate val loss______________________________
+    
+    # Print validation loss once in a while
+    if epoch % 100 == 0:
+        model.eval()
+        val_data_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_data_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type = autocast_device, dtype = torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op = dist.ReduceOp.AVG)
+        if master_process:
+            print(f"Validation Loss --> {val_loss_accum.item():.4f}")
+
+    # __________________generate sample text____________________________
+
+    # Print some samples every once in a while 
+    if generate_samples and epoch > 0 and epoch % 3 == 0:
+        # model in eval
+        model.eval()
+        # Get tokens of input
+        num_returned_sequences = 2
+        max_length = 32
+        tokens = tiktoken.get_encoding(text)
+        tokens = torch.tensor(tokens, dtype = torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_returned_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device = device)
+        sample_rng.manual_seed(40 + ddp_rank)
+        # Keep generating until max_length is reached
+        while xgen.size(1) < max_length:
+            with torch.no_grad():
+                # Feedforward
+                logits = model(xgen)
+                # Grab the last token logits
+                logits = logits[:, -1, :]       # [B, vocab_size]
+                # Get the probabilities to sample from
+                probs = F.softmax(logits, dim = -1)     # [B, vocab_size]
+                # Only consider the top 50 probs by default, Take the top 50 probs and make others zero and resample it.
+                # This way we never choose next token that is less likely even by chance. Everything is from the top 50
+                top_probs, top_indices = probs.topk(k = 50, dim = -1)       # [B, 50]
+                # Now sample from this top_prob (returns the index of chosen value from dist)
+                ix = torch.multinomial(top_probs, num_samples = 1, generator = sample_rng)       # [B, 1]
+                # Gather the topk incides
+                xval = torch.gather(top_indices, -1, ix)        # [B, 1]
+                # Append to the input sequence to repeat
+                x = torch.cat([x, xval], dim=-1)                # [B, 1]
+        # Print the generated text
+
+
+    # __________training | forward -> backward -> update__________________
+
+    # Put model in train mode
+    model.train()
     # Zero grad
     optimizer.zero_grad()
-
     # To keep track of loss for the batch instead of micro_batch
     loss_accum = 0.0
-
     # Gradient accumulation for simulating bigger batches
     for micro_step in range(grad_accum_steps):
         # Fetch a new batch
-        x, y = data_loader.next_batch()
+        x, y = train_data_loader.next_batch()
         x, y = x.to(device), y.to(device)
         # Feed forward with dtype = torch.bfloat16 whenever possible (some operations) to speed up matmul
         # with torch.autocast(device_type = device, dtype = torch.bfloat16):
@@ -365,35 +451,30 @@ for epoch in range(epochs):
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         # Zero grad and backward pass
         loss.backward()
-
     # Enabling sync of losses across all the processes for the master process to print 
     if ddp:
         dist.all_reduce(loss_accum, op = dist.ReduceOp.AVG)
-
     # Clipping the gradient to avoid shock inscase a bad batch comes in.
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
     # Get learning rate based on the learning rate scheduler and use this in optimizer
     lr = get_lr(epoch)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-
     # Update step
     optimizer.step()
-
     # To have cuda and cpu sync with no pending works
     torch.cuda.synchronize()
-
     # record time
     tick = time.time()
     dt = (tick - tock)
-
     # How many tokens processed per sec
-    tokens_processed = data_loader.B * data_loader.T * grad_accum_steps * ddp_world_size
+    tokens_processed = train_data_loader.B * train_data_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
     # Print Stats
     if master_process:
         print(f"Epoch {epoch}/{epochs} | Loss --> {loss_accum:.2f}| Grad norm --> {norm:4f} | LR --> {lr:.4f} | Time --> {dt:.2f} | Tokens/sec --> {tokens_per_sec:.2f}")
+
+# ____________________________________DESTROY PROCESSES________________________________________________________
 
 # Clean exit of processes
 if ddp:
@@ -401,33 +482,4 @@ if ddp:
 
 sys.exit(0)
 
-# _____________________________ GENERATE ___________________________________________________________
-
-# Generating Loop
-torch.manual_seed(55)
-torch.cuda.manual_seed(55)
-
-while x.size(1) < max_length:
-    with torch.no_grad():
-        # Feedforward
-        logits = model(x)
-        # Grab the last token logits
-        logits = logits[:, -1, :]       # [B, vocab_size]
-        # Get the probabilities to sample from
-        probs = F.softmax(logits, dim = -1)     # [B, vocab_size]
-        # Only consider the top 50 probs by default, Take the top 50 probs and make others zero and resample it.
-        # This way we never choose next token that is less likely even by chance. Everything is from the top 50
-        top_probs, top_indices = probs.topk(k = 50, dim = -1)       # [B, 50]
-        # Now sample from this top_prob (returns the index of chosen value from dist)
-        ix = torch.multinomial(top_probs, num_samples = 1)       # [B, 1]
-        # Gather the topk incides
-        xval = torch.gather(top_indices, -1, ix)        # [B, 1]
-        # Append to the input sequence to repeat
-        x = torch.cat([x, xval], dim=-1)                # [B, 1]
-
-
-# Printing the generated text
-for i in range(num_returned_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = encoder.decode(tokens)
-    print(">", decoded)
+# ______________________________________ END YAY! ______________________________________________________
